@@ -20,11 +20,12 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
-  Serial.print("Btn stats: ");
+  Serial.println("Btn triggered!");
   // Serial.print();
-  Serial.println();
+  // Serial.println();
 
   while (true) {
+
 
     for (pos = 0; pos <= 50; pos += 1) { // goes from 0 degrees to 180 degrees
       // in steps of 1 degree
@@ -32,14 +33,14 @@ void loop() {
       delay(10);                       // waits 15 ms for the servo to reach the position
     }
 
-    delay(200);
+    delay(500);
 
     for (pos = 50; pos >= 0; pos -= 1) { // goes from 180 degrees to 0 degrees
       myservo.write(pos);              // tell servo to go to position in variable 'pos'
       delay(10);                       // waits 15 ms for the servo to reach the position
     }
 
-    delay(200);
+    delay(1000);
 
   }
 }
