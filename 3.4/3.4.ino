@@ -23,6 +23,7 @@ const int PIN_SERVO_RIGHT = 4;
 const int BLACK = LOW;   // 检测到黑线输出 0
 const int WHITE = HIGH;  // 检测到白色地面输出 1
 
+delay(200);
 int pos = 0; //顶部舵机角度
 const int BTN_SW_PIN = 6;
 

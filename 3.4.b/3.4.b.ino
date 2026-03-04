@@ -25,6 +25,7 @@ const unsigned long TURN_FIND_LINE_TIMEOUT_MS = 1200;
 const unsigned long UTURN_TIMEOUT_MS = 1800;
 const unsigned long BTN_DEBOUNCE_MS = 30;
 
+delay(200);
 const int DUMP_HOME_ANGLE = 0;
 const int DUMP_RELEASE_ANGLE = 50;
 
