@@ -5,6 +5,8 @@ Servo myservo;  // create Servo object to control a servo
 
 int pos = 0;
 
+
+
 void setup() {
   // put your setup code here, to run once:
   myservo.attach(7);
@@ -17,6 +19,9 @@ void setup() {
   // wait for pressing
   while (digitalRead(btnsw) == 1){}
 }
+
+
+
 
 void loop() {
   // put your main code here, to run repeatedly:
