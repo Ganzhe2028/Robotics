@@ -34,7 +34,7 @@ const unsigned long BTN_DEBOUNCE_MS = 30;                   // Debounce period t
 
 // Servo angles for the dumping mechanism
 const int DUMP_HOME_ANGLE = 0;                              // Resting/home position angle for dump servo
-const int DUMP_RELEASE_ANGLE = 50;                          // Angle required to release/dump the load
+const int DUMP_RELEASE_ANGLE = 80;                          // Angle required to release/dump the load
 
 // Servo control objects
 Servo leftServo;
