@@ -1,59 +1,85 @@
 #include <Servo.h>
 
 // ===== Pin Map =====
-// Sensor pins (L2, L1 are left; R1, R2 are right)
 #define PIN_SENSOR_L2 10
 #define PIN_SENSOR_L1 11
 #define PIN_SENSOR_R1 9
 #define PIN_SENSOR_R2 8
 
-// Servo motor pins
 #define PIN_SERVO_LEFT 5
 #define PIN_SERVO_RIGHT 4
-#define PIN_SERVO_DUMP 7 // Servo for the dumping mechanism
+#define PIN_SERVO_DUMP 7
 
-// Button pin for starting the robot
-#define PIN_BTN_SW 6
+#define PIN_BTN_SELECT 12
+#define PIN_BTN_START 6
 
 // ===== Logic Level =====
-// Logical definitions for sensor readings and button state
-#define BLACK LOW
-#define WHITE HIGH
+#define BLACK HIGH
+#define WHITE LOW
 #define BTN_PRESSED LOW
 
 // ===== Tunables =====
-// Timing constants for various operations (in milliseconds)
-const unsigned long LOOP_DELAY_MS = 10;                     // Delay at the end of each main loop iteration
-const unsigned long LINE_END_CONFIRM_MS = 250;              // Time to move forward to confirm line end
-const unsigned long TURN_FORWARD_MS = 500;                  // Time to move forward before turning at a right angle
-const unsigned long TURN_FIND_LINE_TIMEOUT_MS = 1200;       // Max time to rotate while searching for a line
-const unsigned long UTURN_TIMEOUT_MS = 1800;                // Max time allowed for a U-turn operation
-const unsigned long BTN_DEBOUNCE_MS = 30;                   // Debounce period to ensure stable button press readings
+const unsigned long LOOP_DELAY_MS = 10;
+const unsigned long BUTTON_DEBOUNCE_MS = 30;
+const unsigned long SENSOR_EVENT_BLOCK_MS = 100;
+const unsigned long END_CONFIRM_MS = 300;
+const unsigned long STATUS_PRINT_MS = 120;
+const unsigned long TURN_FORWARD_MS = 500;
+const unsigned long SEEK_LINE_LOG_MS = 1000;
+const unsigned long DROP_PAYLOAD_MS = 500;
+const unsigned long DROP_RETURN_SETTLE_MS = 250;
+const unsigned long DROP_EXIT_MS = 150;
 
-// delay(200); // WARNING: This is in global scope and may cause compilation errors in standard C++/Arduino
+const int DUMP_HOME_ANGLE = 0;
+const int DUMP_RELEASE_ANGLE = 80;
 
-// Servo angles for the dumping mechanism
-const int DUMP_HOME_ANGLE = 0;                              // Resting/home position angle for dump servo
-const int DUMP_RELEASE_ANGLE = 80;                          // Angle required to release/dump the load
+enum RobotState {
+  STATE_SETTING_TARGET,
+  STATE_RUNNING,
+  STATE_DROPPING,
+  STATE_TURNING
+};
 
-// Servo control objects
+enum GapMode {
+  MODE_ADD,
+  MODE_SUB
+};
+
+struct Sensors {
+  int l2;
+  int l1;
+  int r1;
+  int r2;
+};
+
+struct ButtonState {
+  uint8_t pin;
+  bool stableLevel;
+  bool lastReading;
+  unsigned long lastChangeTime;
+};
+
 Servo leftServo;
 Servo rightServo;
 Servo dumpServo;
 
-// State flags
-bool straightLineArmed = false;                             // Flag to indicate if the robot is currently tracking a straight center line
-bool dumpServoAttached = false;                             // Flag to track whether the dump servo is currently attached to save power/reduce jitter
+ButtonState selectButton = {PIN_BTN_SELECT, HIGH, HIGH, 0};
+ButtonState startButton = {PIN_BTN_START, HIGH, HIGH, 0};
 
-// Structure to hold readings from the four line tracking sensors
-struct Sensors {
-  int l2; // Far left
-  int l1; // Inner left
-  int r1; // Inner right
-  int r2; // Far right
-};
+RobotState robotState = STATE_SETTING_TARGET;
+GapMode mode = MODE_ADD;
 
-// Reads all four line sensors and returns their states
+int targetStation = 1;
+int stationNum = 0;
+int boxNum = 0;
+
+bool straightLineArmed = false;
+bool dumpServoAttached = false;
+bool stationLatched = false;
+bool gapLatched = false;
+bool isTurning = false;
+bool isDropping = false;
+
 Sensors readSensors() {
   Sensors s;
   s.l2 = digitalRead(PIN_SENSOR_L2);
@@ -63,30 +89,59 @@ Sensors readSensors() {
   return s;
 }
 
-// Checks if all sensors detect white (e.g., crossing a horizontal line or end of path)
 bool isAllWhite(const Sensors &s) {
   return s.l2 == WHITE && s.l1 == WHITE && s.r1 == WHITE && s.r2 == WHITE;
 }
 
-// Checks if the robot is perfectly centered on the line (inner sensors black, outer white)
+bool isAllBlack(const Sensors &s) {
+  return s.l2 == BLACK && s.l1 == BLACK && s.r1 == BLACK && s.r2 == BLACK;
+}
+
 bool isCenterLine(const Sensors &s) {
-  // 1001 binary representation concept: outer sensors see white (1), inner see black (0)
-  return s.l2 == WHITE && s.l1 == BLACK && s.r1 == BLACK && s.r2 == WHITE; 
+  return s.l2 == WHITE && s.l1 == BLACK && s.r1 == BLACK && s.r2 == WHITE;
 }
 
-// Checks for a left turn marker/signal (left outer sensor detecting black, right outer white)
+bool isGapMark(const Sensors &s) {
+  return isAllWhite(s);
+}
+
+bool isStationMark(const Sensors &s) {
+  return isAllBlack(s);
+}
+
 bool isLeftTurnSignal(const Sensors &s) {
-  return s.l2 == BLACK && s.r2 == WHITE;
+  return s.l2 == BLACK && s.r2 == WHITE && !isStationMark(s);
 }
 
-// Checks for a right turn marker/signal (right outer sensor detecting black, left outer white)
 bool isRightTurnSignal(const Sensors &s) {
-  return s.l2 == WHITE && s.r2 == BLACK;
+  return s.l2 == WHITE && s.r2 == BLACK && !isStationMark(s);
 }
 
-// ===== Movement Control Functions =====
-// Since continuous rotation servos are used, 90 is stop, 0 is full reverse, 180 is full forward.
-// Note: right servo is mounted opposite to the left servo, so writing 0 to right servo means forward.
+const char *stateName(RobotState state) {
+  switch (state) {
+    case STATE_SETTING_TARGET:
+      return "SETTING_TARGET";
+    case STATE_RUNNING:
+      return "RUNNING";
+    case STATE_DROPPING:
+      return "DROPPING";
+    case STATE_TURNING:
+      return "TURNING";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char *modeName(GapMode currentMode) {
+  return currentMode == MODE_ADD ? "ADD" : "SUB";
+}
+
+void printSensorPattern(const Sensors &s) {
+  Serial.print(s.l2);
+  Serial.print(s.l1);
+  Serial.print(s.r1);
+  Serial.print(s.r2);
+}
 
 void stopMoving() {
   leftServo.write(90);
@@ -98,7 +153,6 @@ void moveForward() {
   rightServo.write(0);
 }
 
-// Soft turns: One wheel stops while the other moves forward
 void turnLeftSoft() {
   leftServo.write(90);
   rightServo.write(0);
@@ -109,7 +163,6 @@ void turnRightSoft() {
   rightServo.write(90);
 }
 
-// Hard turns: Wheels move in opposite directions to rotate on the spot
 void turnLeftHard() {
   leftServo.write(0);
   rightServo.write(0);
@@ -120,10 +173,59 @@ void turnRightHard() {
   rightServo.write(180);
 }
 
-// Rotates the robot in place until one of the inner sensors detects the line or a timeout occurs
+void attachDumpServoIfNeeded() {
+  if (dumpServoAttached) {
+    return;
+  }
+
+  dumpServo.attach(PIN_SERVO_DUMP);
+  dumpServoAttached = true;
+  dumpServo.write(DUMP_HOME_ANGLE);
+  delay(120);
+}
+
+void detachDumpServoIfNeeded() {
+  if (!dumpServoAttached) {
+    return;
+  }
+
+  dumpServo.detach();
+  dumpServoAttached = false;
+}
+
+void resetTripState() {
+  stationNum = 0;
+  boxNum = 0;
+  mode = MODE_ADD;
+  straightLineArmed = false;
+  stationLatched = false;
+  gapLatched = false;
+}
+
+bool pollButtonPress(ButtonState &button) {
+  bool reading = digitalRead(button.pin);
+
+  if (reading != button.lastReading) {
+    button.lastReading = reading;
+    button.lastChangeTime = millis();
+  }
+
+  if ((millis() - button.lastChangeTime) < BUTTON_DEBOUNCE_MS) {
+    return false;
+  }
+
+  if (reading == button.stableLevel) {
+    return false;
+  }
+
+  button.stableLevel = reading;
+  return button.stableLevel == BTN_PRESSED;
+}
+
 void rotateUntilLineFound(bool turnLeft) {
-  unsigned long startTime = millis();
-  while (millis() - startTime < TURN_FIND_LINE_TIMEOUT_MS) {
+  unsigned long lastLogTime = millis();
+
+  while (true) {
     if (turnLeft) {
       turnLeftHard();
     } else {
@@ -131,231 +233,328 @@ void rotateUntilLineFound(bool turnLeft) {
     }
 
     Sensors s = readSensors();
-    // Stop rotating as soon as an inner sensor detects the black line
     if (s.l1 == BLACK || s.r1 == BLACK) {
-      Serial.println(F("[TURN] line found, exit rotate"));
-      break;
+      Serial.println(F("[SEEK] line found"));
+      return;
     }
+
+    if (millis() - lastLogTime >= SEEK_LINE_LOG_MS) {
+      lastLogTime = millis();
+      Serial.println(F("[SEEK] still searching"));
+    }
+
     delay(1);
   }
 }
 
-// Handles right-angle turns upon detecting a turn signal marker
 void handleRightAngleTurn(bool turnLeft) {
   Serial.println(turnLeft ? F("[TURN] left signal") : F("[TURN] right signal"));
-  
-  // Move forward briefly to align the rotation center with the intersecting line
   moveForward();
   delay(TURN_FORWARD_MS);
 
   Sensors s = readSensors();
-  // If moving forward put us entirely in a white zone, find the line again
   if (isAllWhite(s)) {
-    Serial.println(F("[TURN] crossed corner, rotate to find line"));
     rotateUntilLineFound(turnLeft);
   }
 }
 
-// Checks to confirm we have reached the genuine end of the line (all white after moving forward)
-bool confirmLineEnd() {
-  moveForward();
-  delay(LINE_END_CONFIRM_MS);
-  Sensors s = readSensors();
-  return isAllWhite(s);
+void completeStationIfNeeded() {
+  if (mode != MODE_SUB) {
+    return;
+  }
+
+  if (boxNum > 0) {
+    return;
+  }
+
+  boxNum = 0;
+  mode = MODE_ADD;
+  Serial.println(F("[MODE] station complete -> ADD"));
 }
 
-// Attaches the dump servo to its pin only when needed, to save power and prevent jitter
-void attachDumpServoIfNeeded() {
-  if (!dumpServoAttached) {
-    dumpServo.attach(PIN_SERVO_DUMP);
-    dumpServoAttached = true;
-    Serial.println(F("[DUMP] attach top servo"));
-    dumpServo.write(DUMP_HOME_ANGLE);
-    delay(120);
+bool shouldCheckLineEnd() {
+  return stationNum == 3 && boxNum == 0 && mode == MODE_ADD;
+}
+
+bool confirmLineEndCandidate() {
+  unsigned long startTime = millis();
+  Serial.println(F("[END] candidate"));
+
+  while (true) {
+    moveForward();
+
+    Sensors s = readSensors();
+    if (!isGapMark(s)) {
+      Serial.println(F("[END] released -> gap"));
+      return false;
+    }
+
+    if (millis() - startTime >= END_CONFIRM_MS) {
+      Serial.println(F("[END] confirmed"));
+      return true;
+    }
+
+    delay(1);
   }
 }
 
-// Executes the dumping sequence to drop a load and then performs a U-turn to return
-void unloadAndUTurn() {
-  Serial.println(F("[DUMP] line end confirmed"));
-  stopMoving();
+void performDropoff() {
+  robotState = STATE_DROPPING;
+  isDropping = true;
+  Serial.println(F("[DROP] start"));
 
+  stopMoving();
   attachDumpServoIfNeeded();
 
-  // Smoothly move the dump servo to the release angle
   for (int pos = DUMP_HOME_ANGLE; pos <= DUMP_RELEASE_ANGLE; pos++) {
     dumpServo.write(pos);
     delay(10);
   }
 
-  delay(500); // Allow time for payload to drop
+  delay(DROP_PAYLOAD_MS);
 
-  // Smoothly return the dump servo to the home angle
   for (int pos = DUMP_RELEASE_ANGLE; pos >= DUMP_HOME_ANGLE; pos--) {
     dumpServo.write(pos);
     delay(10);
   }
 
-  delay(250);
+  delay(DROP_RETURN_SETTLE_MS);
+  detachDumpServoIfNeeded();
 
-  // Release PWM after unload to reduce interference/jitter.
-  dumpServo.detach();
-  dumpServoAttached = false;
-  Serial.println(F("[DUMP] detach top servo"));
+  moveForward();
+  delay(DROP_EXIT_MS);
 
-  // Perform a 180-degree hard U-turn until line is found again
-  turnLeftHard();
-  unsigned long startTime = millis();
-  while (millis() - startTime < UTURN_TIMEOUT_MS) {
-    Sensors s = readSensors();
-    if (s.l1 == BLACK || s.r1 == BLACK) {
-      Serial.println(F("[UTURN] line found, exit"));
-      break;
+  isDropping = false;
+  robotState = STATE_RUNNING;
+  Serial.println(F("[DROP] done"));
+}
+
+void performTurnaround() {
+  robotState = STATE_TURNING;
+  isTurning = true;
+  Serial.println(F("[TURN] start u-turn"));
+
+  stopMoving();
+  delay(120);
+
+  rotateUntilLineFound(true);
+  moveForward();
+  delay(DROP_EXIT_MS);
+
+  resetTripState();
+  robotState = STATE_RUNNING;
+  isTurning = false;
+  Serial.println(F("[TURN] new trip"));
+}
+
+void handleGapEvent() {
+  straightLineArmed = false;
+
+  if (shouldCheckLineEnd() && confirmLineEndCandidate()) {
+    performTurnaround();
+    return;
+  }
+
+  if (mode == MODE_ADD) {
+    boxNum++;
+  } else if (boxNum > 0) {
+    boxNum--;
+  }
+
+  Serial.print(F("[GAP] mode="));
+  Serial.print(modeName(mode));
+  Serial.print(F(" b="));
+  Serial.println(boxNum);
+
+  completeStationIfNeeded();
+  delay(SENSOR_EVENT_BLOCK_MS);
+}
+
+void handleStationEvent() {
+  int currentStation = boxNum + 1;
+  stationNum++;
+  straightLineArmed = false;
+
+  Serial.print(F("[STATION] current="));
+  Serial.print(currentStation);
+  Serial.print(F(" target="));
+  Serial.print(targetStation);
+  Serial.print(F(" s="));
+  Serial.println(stationNum);
+
+  if (currentStation == targetStation) {
+    performDropoff();
+  }
+
+  mode = MODE_SUB;
+  completeStationIfNeeded();
+  delay(SENSOR_EVENT_BLOCK_MS);
+}
+
+void beginRunning() {
+  resetTripState();
+  robotState = STATE_RUNNING;
+  Serial.print(F("[BOOT] start target="));
+  Serial.println(targetStation);
+}
+
+void handleSettingTarget() {
+  stopMoving();
+
+  if (pollButtonPress(selectButton)) {
+    if (targetStation < 3) {
+      targetStation++;
     }
-    delay(1);
+
+    Serial.print(F("[SET] targetStation="));
+    Serial.println(targetStation);
   }
+
+  if (!pollButtonPress(startButton)) {
+    return;
+  }
+
+  Sensors s = readSensors();
+  if (!isCenterLine(s)) {
+    Serial.print(F("[BOOT] place robot on 0110, got "));
+    printSensorPattern(s);
+    Serial.println();
+    return;
+  }
+
+  beginRunning();
 }
 
-// Reads the start button and uses a software debounce to ensure the press is stable
-bool isPressedStable(unsigned long stableMs) {
-  if (digitalRead(PIN_BTN_SW) != BTN_PRESSED) {
-    return false;
+void followLine(const Sensors &s) {
+  if (isCenterLine(s)) {
+    straightLineArmed = true;
   }
-  unsigned long start = millis();
-  while (millis() - start < stableMs) {
-    // If the button bounces high again, return false
-    if (digitalRead(PIN_BTN_SW) != BTN_PRESSED) {
-      return false;
+
+  if (straightLineArmed && isLeftTurnSignal(s)) {
+    straightLineArmed = false;
+    handleRightAngleTurn(true);
+    return;
+  }
+
+  if (straightLineArmed && isRightTurnSignal(s)) {
+    straightLineArmed = false;
+    handleRightAngleTurn(false);
+    return;
+  }
+
+  if (s.l2 == WHITE && s.r2 == WHITE) {
+    if (s.l1 == BLACK && s.r1 == BLACK) {
+      moveForward();
+    } else if (s.l1 == BLACK && s.r1 == WHITE) {
+      turnLeftSoft();
+    } else if (s.l1 == WHITE && s.r1 == BLACK) {
+      turnRightSoft();
+    } else if (isAllWhite(s)) {
+      moveForward();
+    } else {
+      stopMoving();
     }
-    delay(1);
+    return;
   }
-  return true; // Press held consistently for the entire stableMs duration
+
+  stopMoving();
 }
 
-// Blocks execution until the start button is safely pressed and released
-void waitForStartButton() {
-  Serial.println(F("[BOOT] waiting button release..."));
-  // Ensure the button is fully released before we start waiting for a press
-  while (digitalRead(PIN_BTN_SW) == BTN_PRESSED) {
-    delay(5);
+void handleRunning() {
+  Sensors s = readSensors();
+
+  if (!isStationMark(s)) {
+    stationLatched = false;
+  }
+  if (!isGapMark(s)) {
+    gapLatched = false;
   }
 
-  Serial.println(F("[BOOT] waiting button press..."));
-  // Wait indefinitely for a stable button press event
-  while (!isPressedStable(BTN_DEBOUNCE_MS)) {
-    delay(5);
+  if (!stationLatched && isStationMark(s)) {
+    stationLatched = true;
+    handleStationEvent();
+    return;
   }
 
-  // Wait for the final release of the button
-  while (digitalRead(PIN_BTN_SW) == BTN_PRESSED) {
-    delay(5);
+  if (!gapLatched && isGapMark(s)) {
+    gapLatched = true;
+    handleGapEvent();
+    return;
   }
 
-  Serial.println(F("[BOOT] button confirmed, start"));
+  followLine(s);
 }
 
+void printStatus() {
+  static unsigned long lastPrintTime = 0;
 
-// ===== Core System Loops =====
+  if (millis() - lastPrintTime < STATUS_PRINT_MS) {
+    return;
+  }
+
+  lastPrintTime = millis();
+  Sensors s = readSensors();
+
+  Serial.print(F("[STATUS] state="));
+  Serial.print(stateName(robotState));
+  Serial.print(F(" target="));
+  Serial.print(targetStation);
+  Serial.print(F(" s="));
+  Serial.print(stationNum);
+  Serial.print(F(" b="));
+  Serial.print(boxNum);
+  Serial.print(F(" mode="));
+  Serial.print(modeName(mode));
+  Serial.print(F(" turning="));
+  Serial.print(isTurning ? 1 : 0);
+  Serial.print(F(" dropping="));
+  Serial.print(isDropping ? 1 : 0);
+  Serial.print(F(" sensors="));
+  printSensorPattern(s);
+  Serial.println();
+}
 
 void setup() {
   Serial.begin(9600);
   Serial.println(F("[BOOT] init"));
 
-  // Initialize line sensor pins as inputs
   pinMode(PIN_SENSOR_L2, INPUT);
   pinMode(PIN_SENSOR_L1, INPUT);
   pinMode(PIN_SENSOR_R1, INPUT);
   pinMode(PIN_SENSOR_R2, INPUT);
 
-  // Initialize start button pin with internal pullup resistor
-  pinMode(PIN_BTN_SW, INPUT_PULLUP);
+  pinMode(PIN_BTN_SELECT, INPUT_PULLUP);
+  pinMode(PIN_BTN_START, INPUT_PULLUP);
 
-  // Attach movement servos and command them to stop immediately
+  selectButton.stableLevel = digitalRead(PIN_BTN_SELECT);
+  selectButton.lastReading = selectButton.stableLevel;
+  selectButton.lastChangeTime = millis();
+
+  startButton.stableLevel = digitalRead(PIN_BTN_START);
+  startButton.lastReading = startButton.stableLevel;
+  startButton.lastChangeTime = millis();
+
   leftServo.attach(PIN_SERVO_LEFT);
   rightServo.attach(PIN_SERVO_RIGHT);
   stopMoving();
 
-  // Keep dump servo detached on boot to avoid startup jump to 90 deg.
   dumpServo.detach();
   dumpServoAttached = false;
-  Serial.println(F("[BOOT] dump servo detached"));
 
-  // Wait for the human operator to press the start button
-  waitForStartButton();
+  resetTripState();
+
+  Serial.println(F("[BOOT] select target with D12, start with D6"));
+  Serial.println(F("[BOOT] default targetStation=1"));
 }
 
 void loop() {
-  // Read current line sensor states
-  Sensors s = readSensors();
+  printStatus();
 
-  // Debug print: output sensors + armed state periodically for first-run issue tracing.
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 80) { // Print every ~80ms to avoid serial buffer locking
-    lastPrint = millis();
-    Serial.print(F("[S] "));
-    Serial.print(s.l2); Serial.print(' ');
-    Serial.print(s.l1); Serial.print(' ');
-    Serial.print(s.r1); Serial.print(' ');
-    Serial.print(s.r2); Serial.print(F(" | armed="));
-    Serial.println(straightLineArmed ? 1 : 0);
+  if (robotState == STATE_SETTING_TARGET) {
+    handleSettingTarget();
+  } else if (robotState == STATE_RUNNING) {
+    handleRunning();
   }
 
-  // Arm straight line tracking if center line format is perfectly matched
-  if (isCenterLine(s)) {
-    straightLineArmed = true;
-  }
-
-  // Split after center-line state: Handle corner turning or line-end sequence.
-  // We only execute these commands if we previously confirmed stable straight tracking (armed).
-  if (straightLineArmed && isLeftTurnSignal(s)) {
-    straightLineArmed = false; // Disarm to prevent re-triggering during turn maneuver
-    handleRightAngleTurn(true); // Process the left right-angle turn
-    delay(LOOP_DELAY_MS);
-    return;
-  }
-  
-  if (straightLineArmed && isRightTurnSignal(s)) {
-    straightLineArmed = false; // Disarm
-    handleRightAngleTurn(false); // Process the right right-angle turn
-    delay(LOOP_DELAY_MS);
-    return;
-  }
-  
-  if (straightLineArmed && isAllWhite(s) && confirmLineEnd()) {
-    straightLineArmed = false; // Disarm
-    unloadAndUTurn(); // Trigger dumping container sequence then flip 180 degrees
-    delay(LOOP_DELAY_MS);
-    return;
-  }
-
-  // Normal proportional-like line tracking logic
-  if (isLeftTurnSignal(s)) {
-    handleRightAngleTurn(true);
-  } else if (isRightTurnSignal(s)) {
-    handleRightAngleTurn(false);
-  } else if (s.l2 == WHITE && s.r2 == WHITE) { 
-    // Outer sensors are safely over white background, adjust heading based on inner sensors
-    if (s.l1 == BLACK && s.r1 == BLACK) {
-      // Both inner sensors see black: go dead straight
-      moveForward();
-    } else if (s.l1 == BLACK && s.r1 == WHITE) {
-      // Line is biased left, softly correct course to the left
-      turnLeftSoft();
-    } else if (s.l1 == WHITE && s.r1 == BLACK) {
-      // Line is biased right, softly correct course to the right
-      turnRightSoft();
-    } else if (isAllWhite(s)) {
-      // Lost the line completely: cautiously inch forward to see if we can catch it
-      moveForward();
-    } else {
-      // Unknown edge-case state, stop to prevent runaway
-      stopMoving();
-    }
-  } else {
-    // If outer sensors trigger unexpectedly outside designated intersections, stop
-    stopMoving();
-  }
-
-  // End of loop cycle delay
   delay(LOOP_DELAY_MS);
 }
