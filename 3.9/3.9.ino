@@ -24,7 +24,7 @@ const unsigned long LOOP_DELAY_MS = 10;
 const unsigned long BUTTON_DEBOUNCE_MS = 30;
 const unsigned long SENSOR_EVENT_BLOCK_MS = 100;
 const unsigned long END_CONFIRM_MS = 300;
-const unsigned long STATUS_PRINT_MS = 120;
+const unsigned long STATUS_PRINT_MS = 800;
 const unsigned long TURN_FORWARD_MS = 500;
 const unsigned long SEEK_LINE_LOG_MS = 1000;
 const unsigned long DROP_PAYLOAD_MS = 500;
@@ -90,12 +90,17 @@ bool gapLatched = false;
 bool isTurning = false;
 bool isDropping = false;
 
+int readNormalizedSensor(uint8_t pin) {
+  int rawValue = digitalRead(pin);
+  return rawValue == HIGH ? WHITE : BLACK;
+}
+
 Sensors readSensors() {
   Sensors s;
-  s.l2 = digitalRead(PIN_SENSOR_L2);
-  s.l1 = digitalRead(PIN_SENSOR_L1);
-  s.r1 = digitalRead(PIN_SENSOR_R1);
-  s.r2 = digitalRead(PIN_SENSOR_R2);
+  s.l2 = readNormalizedSensor(PIN_SENSOR_L2);
+  s.l1 = readNormalizedSensor(PIN_SENSOR_L1);
+  s.r1 = readNormalizedSensor(PIN_SENSOR_R1);
+  s.r2 = readNormalizedSensor(PIN_SENSOR_R2);
   return s;
 }
 
@@ -245,12 +250,6 @@ bool pollButtonReleaseEvent(ButtonState &button) {
   if (reading != button.lastReading) {
     button.lastReading = reading;
     button.lastChangeTime = millis();
-
-    printPrefix();
-    Serial.print(F("[RAW] "));
-    Serial.print(button.name);
-    Serial.print(F(" -> "));
-    Serial.println(levelName(reading));
   }
 
   if ((millis() - button.lastChangeTime) < BUTTON_DEBOUNCE_MS) {
@@ -264,14 +263,6 @@ bool pollButtonReleaseEvent(ButtonState &button) {
   button.stableLevel = reading;
   button.stableSinceTime = millis();
   button.stuckLowWarned = false;
-
-  printPrefix();
-  Serial.print(F("[BTN] "));
-  Serial.print(button.name);
-  Serial.print(button.stableLevel == BTN_PRESSED ? F(" PRESSED ") : F(" RELEASED "));
-  Serial.print(F("("));
-  Serial.print(levelName(button.stableLevel));
-  Serial.println(F(")"));
 
   if (button.stableLevel == BTN_PRESSED) {
     button.pressedArmed = true;
@@ -337,7 +328,7 @@ void rotateUntilLineFound(bool turnLeft) {
 }
 
 void handleRightAngleTurn(bool turnLeft) {
-  Serial.println(turnLeft ? F("[TURN] left signal") : F("[TURN] right signal"));
+  Serial.println(turnLeft ? F("[TURN] L") : F("[TURN] R"));
   moveForward();
   delay(TURN_FORWARD_MS);
 
@@ -358,7 +349,7 @@ void completeStationIfNeeded() {
 
   boxNum = 0;
   mode = MODE_ADD;
-  Serial.println(F("[MODE] station complete -> ADD"));
+  Serial.println(F("[MODE] A"));
 }
 
 bool shouldCheckLineEnd() {
@@ -367,19 +358,19 @@ bool shouldCheckLineEnd() {
 
 bool confirmLineEndCandidate() {
   unsigned long startTime = millis();
-  Serial.println(F("[END] candidate"));
+  Serial.println(F("[END] ?"));
 
   while (true) {
     moveForward();
 
     Sensors s = readSensors();
     if (!isGapMark(s)) {
-      Serial.println(F("[END] released -> gap"));
+      Serial.println(F("[END] gap"));
       return false;
     }
 
     if (millis() - startTime >= END_CONFIRM_MS) {
-      Serial.println(F("[END] confirmed"));
+      Serial.println(F("[END] yes"));
       return true;
     }
 
@@ -421,7 +412,7 @@ void performDropoff() {
 void performTurnaround() {
   robotState = STATE_TURNING;
   isTurning = true;
-  Serial.println(F("[TURN] start u-turn"));
+  Serial.println(F("[TURN] U"));
 
   stopMoving();
   delay(120);
@@ -433,7 +424,7 @@ void performTurnaround() {
   resetTripState();
   robotState = STATE_RUNNING;
   isTurning = false;
-  Serial.println(F("[TURN] new trip"));
+  Serial.println(F("[TURN] done"));
 }
 
 void handleGapEvent() {
@@ -450,8 +441,8 @@ void handleGapEvent() {
     boxNum--;
   }
 
-  Serial.print(F("[GAP] mode="));
-  Serial.print(modeName(mode));
+  Serial.print(F("[GAP] "));
+  Serial.print(mode == MODE_ADD ? 'A' : 'S');
   Serial.print(F(" b="));
   Serial.println(boxNum);
 
@@ -464,9 +455,9 @@ void handleStationEvent() {
   stationNum++;
   straightLineArmed = false;
 
-  Serial.print(F("[STATION] current="));
+  Serial.print(F("[ST] cur="));
   Serial.print(currentStation);
-  Serial.print(F(" target="));
+  Serial.print(F(" tgt="));
   Serial.print(targetStation);
   Serial.print(F(" s="));
   Serial.println(stationNum);
@@ -483,7 +474,7 @@ void handleStationEvent() {
 void beginRunning() {
   resetTripState();
   robotState = STATE_RUNNING;
-  Serial.print(F("[BOOT] start target="));
+  Serial.print(F("[RUN] start t="));
   Serial.println(targetStation);
 }
 
@@ -505,7 +496,7 @@ void handleSettingTarget() {
 
   Sensors s = readSensors();
   if (!isCenterLine(s)) {
-    Serial.print(F("[BOOT] place robot on 0110, got "));
+    Serial.print(F("[READY] need 0110 got "));
     printSensorPattern(s);
     Serial.println();
     return;
@@ -584,34 +575,29 @@ void printStatus() {
   lastPrintTime = millis();
   Sensors s = readSensors();
 
-  Serial.print(F("[STATUS] state="));
-  Serial.print(stateName(robotState));
-  Serial.print(F(" target="));
+  if (robotState == STATE_SETTING_TARGET) {
+    Serial.print(F("[READY] t="));
+    Serial.print(targetStation);
+    Serial.print(F(" s="));
+    printSensorPattern(s);
+    Serial.println(isCenterLine(s) ? F(" ok") : F(" wait"));
+    return;
+  }
+
+  if (robotState != STATE_RUNNING) {
+    return;
+  }
+
+  Serial.print(F("[RUN] t="));
   Serial.print(targetStation);
   Serial.print(F(" s="));
   Serial.print(stationNum);
   Serial.print(F(" b="));
   Serial.print(boxNum);
-  Serial.print(F(" mode="));
-  Serial.print(modeName(mode));
-  Serial.print(F(" turning="));
-  Serial.print(isTurning ? 1 : 0);
-  Serial.print(F(" dropping="));
-  Serial.print(isDropping ? 1 : 0);
-  Serial.print(F(" sensors="));
+  Serial.print(F(" m="));
+  Serial.print(mode == MODE_ADD ? 'A' : 'S');
+  Serial.print(F(" x="));
   printSensorPattern(s);
-
-  if (robotState == STATE_SETTING_TARGET) {
-    Serial.print(F(" startBtn="));
-    Serial.print(levelName(startButton.stableLevel));
-    Serial.print(F(" selectBtn="));
-    Serial.print(levelName(selectButton.stableLevel));
-    Serial.print(F(" armed(start/select)="));
-    Serial.print(startButton.pressedArmed ? 1 : 0);
-    Serial.print('/');
-    Serial.print(selectButton.pressedArmed ? 1 : 0);
-  }
-
   Serial.println();
 }
 
@@ -636,14 +622,15 @@ void setup() {
 
   resetTripState();
 
-  Serial.print(F("[BOOT] START pin="));
+  Serial.print(F("[BOOT] btn start="));
   Serial.print(PIN_BTN_START);
-  Serial.print(F(" SELECT pin="));
+  Serial.print(F(" select="));
   Serial.println(PIN_BTN_SELECT);
-  Serial.println(F("[BOOT] buttons trigger on stable release"));
+  Serial.println(F("[BOOT] sensor raw active-low -> normalized to black=1 white=0"));
+  Serial.println(F("[BOOT] button event = stable release"));
   printButtonBootState(startButton);
   printButtonBootState(selectButton);
-  Serial.println(F("[BOOT] default targetStation=1"));
+  Serial.println(F("[BOOT] target=1"));
 }
 
 void loop() {
