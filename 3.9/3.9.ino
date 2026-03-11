@@ -10,10 +10,11 @@
 #define PIN_SERVO_RIGHT 4
 #define PIN_SERVO_DUMP 7
 
-#define PIN_BTN_SELECT 0
+#define PIN_BTN_SELECT 13
 #define PIN_BTN_START 6
 
 // ===== Logic Level =====
+#define BTN_RELEASED HIGH
 #define BLACK HIGH
 #define WHITE LOW
 #define BTN_PRESSED LOW
@@ -29,6 +30,7 @@ const unsigned long SEEK_LINE_LOG_MS = 1000;
 const unsigned long DROP_PAYLOAD_MS = 500;
 const unsigned long DROP_RETURN_SETTLE_MS = 250;
 const unsigned long DROP_EXIT_MS = 150;
+const unsigned long STUCK_LOW_WARN_MS = 1500;
 
 const int DUMP_HOME_ANGLE = 0;
 const int DUMP_RELEASE_ANGLE = 80;
@@ -54,8 +56,12 @@ struct Sensors {
 
 struct ButtonState {
   uint8_t pin;
+  const char *name;
   bool stableLevel;
   bool lastReading;
+  bool pressedArmed;
+  bool stuckLowWarned;
+  unsigned long stableSinceTime;
   unsigned long lastChangeTime;
 };
 
@@ -63,8 +69,12 @@ Servo leftServo;
 Servo rightServo;
 Servo dumpServo;
 
-ButtonState selectButton = {PIN_BTN_SELECT, HIGH, HIGH, 0};
-ButtonState startButton = {PIN_BTN_START, HIGH, HIGH, 0};
+ButtonState selectButton = {
+  PIN_BTN_SELECT, "SELECT", BTN_RELEASED, BTN_RELEASED, false, false, 0, 0
+};
+ButtonState startButton = {
+  PIN_BTN_START, "START", BTN_RELEASED, BTN_RELEASED, false, false, 0, 0
+};
 
 RobotState robotState = STATE_SETTING_TARGET;
 GapMode mode = MODE_ADD;
@@ -136,6 +146,33 @@ const char *modeName(GapMode currentMode) {
   return currentMode == MODE_ADD ? "ADD" : "SUB";
 }
 
+const char *levelName(bool level) {
+  return level == BTN_PRESSED ? "LOW/PRESSED" : "HIGH/RELEASED";
+}
+
+void printPrefix() {
+  Serial.print('[');
+  Serial.print(millis());
+  Serial.print(F(" ms] "));
+}
+
+void setupButton(ButtonState &button) {
+  pinMode(button.pin, INPUT_PULLUP);
+  button.stableLevel = digitalRead(button.pin);
+  button.lastReading = button.stableLevel;
+  button.pressedArmed = false;
+  button.stuckLowWarned = false;
+  button.stableSinceTime = millis();
+  button.lastChangeTime = millis();
+}
+
+void printButtonBootState(const ButtonState &button) {
+  Serial.print(F("[BOOT] "));
+  Serial.print(button.name);
+  Serial.print(F(" initial state = "));
+  Serial.println(levelName(button.stableLevel));
+}
+
 void printSensorPattern(const Sensors &s) {
   Serial.print(s.l2);
   Serial.print(s.l1);
@@ -202,12 +239,18 @@ void resetTripState() {
   gapLatched = false;
 }
 
-bool pollButtonPress(ButtonState &button) {
+bool pollButtonReleaseEvent(ButtonState &button) {
   bool reading = digitalRead(button.pin);
 
   if (reading != button.lastReading) {
     button.lastReading = reading;
     button.lastChangeTime = millis();
+
+    printPrefix();
+    Serial.print(F("[RAW] "));
+    Serial.print(button.name);
+    Serial.print(F(" -> "));
+    Serial.println(levelName(reading));
   }
 
   if ((millis() - button.lastChangeTime) < BUTTON_DEBOUNCE_MS) {
@@ -219,7 +262,53 @@ bool pollButtonPress(ButtonState &button) {
   }
 
   button.stableLevel = reading;
-  return button.stableLevel == BTN_PRESSED;
+  button.stableSinceTime = millis();
+  button.stuckLowWarned = false;
+
+  printPrefix();
+  Serial.print(F("[BTN] "));
+  Serial.print(button.name);
+  Serial.print(button.stableLevel == BTN_PRESSED ? F(" PRESSED ") : F(" RELEASED "));
+  Serial.print(F("("));
+  Serial.print(levelName(button.stableLevel));
+  Serial.println(F(")"));
+
+  if (button.stableLevel == BTN_PRESSED) {
+    button.pressedArmed = true;
+    return false;
+  }
+
+  if (!button.pressedArmed) {
+    return false;
+  }
+
+  button.pressedArmed = false;
+  return true;
+}
+
+void warnIfButtonStuck(ButtonState &button) {
+  if (button.stableLevel != BTN_PRESSED) {
+    return;
+  }
+
+  if (button.pressedArmed) {
+    return;
+  }
+
+  if (button.stuckLowWarned) {
+    return;
+  }
+
+  if (millis() - button.stableSinceTime < STUCK_LOW_WARN_MS) {
+    return;
+  }
+
+  button.stuckLowWarned = true;
+
+  printPrefix();
+  Serial.print(F("[WARN] "));
+  Serial.print(button.name);
+  Serial.println(F(" held LOW without an edge; check wiring, switch, or pin choice"));
 }
 
 void rotateUntilLineFound(bool turnLeft) {
@@ -401,7 +490,7 @@ void beginRunning() {
 void handleSettingTarget() {
   stopMoving();
 
-  if (pollButtonPress(selectButton)) {
+  if (pollButtonReleaseEvent(selectButton)) {
     if (targetStation < 3) {
       targetStation++;
     }
@@ -410,7 +499,7 @@ void handleSettingTarget() {
     Serial.println(targetStation);
   }
 
-  if (!pollButtonPress(startButton)) {
+  if (!pollButtonReleaseEvent(startButton)) {
     return;
   }
 
@@ -511,6 +600,18 @@ void printStatus() {
   Serial.print(isDropping ? 1 : 0);
   Serial.print(F(" sensors="));
   printSensorPattern(s);
+
+  if (robotState == STATE_SETTING_TARGET) {
+    Serial.print(F(" startBtn="));
+    Serial.print(levelName(startButton.stableLevel));
+    Serial.print(F(" selectBtn="));
+    Serial.print(levelName(selectButton.stableLevel));
+    Serial.print(F(" armed(start/select)="));
+    Serial.print(startButton.pressedArmed ? 1 : 0);
+    Serial.print('/');
+    Serial.print(selectButton.pressedArmed ? 1 : 0);
+  }
+
   Serial.println();
 }
 
@@ -523,16 +624,8 @@ void setup() {
   pinMode(PIN_SENSOR_R1, INPUT);
   pinMode(PIN_SENSOR_R2, INPUT);
 
-  pinMode(PIN_BTN_SELECT, INPUT_PULLUP);
-  pinMode(PIN_BTN_START, INPUT_PULLUP);
-
-  selectButton.stableLevel = digitalRead(PIN_BTN_SELECT);
-  selectButton.lastReading = selectButton.stableLevel;
-  selectButton.lastChangeTime = millis();
-
-  startButton.stableLevel = digitalRead(PIN_BTN_START);
-  startButton.lastReading = startButton.stableLevel;
-  startButton.lastChangeTime = millis();
+  setupButton(selectButton);
+  setupButton(startButton);
 
   leftServo.attach(PIN_SERVO_LEFT);
   rightServo.attach(PIN_SERVO_RIGHT);
@@ -543,7 +636,13 @@ void setup() {
 
   resetTripState();
 
-  Serial.println(F("[BOOT] select target with D12, start with D6"));
+  Serial.print(F("[BOOT] START pin="));
+  Serial.print(PIN_BTN_START);
+  Serial.print(F(" SELECT pin="));
+  Serial.println(PIN_BTN_SELECT);
+  Serial.println(F("[BOOT] buttons trigger on stable release"));
+  printButtonBootState(startButton);
+  printButtonBootState(selectButton);
   Serial.println(F("[BOOT] default targetStation=1"));
 }
 
@@ -551,6 +650,8 @@ void loop() {
   printStatus();
 
   if (robotState == STATE_SETTING_TARGET) {
+    warnIfButtonStuck(startButton);
+    warnIfButtonStuck(selectButton);
     handleSettingTarget();
   } else if (robotState == STATE_RUNNING) {
     handleRunning();
