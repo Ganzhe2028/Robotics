@@ -10,7 +10,7 @@
 #define PIN_SERVO_RIGHT 4
 #define PIN_SERVO_DUMP 7
 
-#define PIN_BTN_SELECT 12
+#define PIN_BTN_SELECT 0
 #define PIN_BTN_START 6
 
 // ===== Logic Level =====
