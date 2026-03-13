@@ -24,7 +24,8 @@ const unsigned long BUTTON_DEBOUNCE_MS = 30;
 const unsigned long START_HOLD_MS = 700;
 const unsigned long TARGET_SELECTION_RESET_MS = 1500;
 const unsigned long SENSOR_EVENT_BLOCK_MS = 100;
-const unsigned long END_CONFIRM_MS = 300;
+const unsigned long CODE_GAP_WARN_MS = 220;
+const unsigned long TURNAROUND_GAP_MS = 300;
 const unsigned long STATUS_PRINT_MS = 800;
 const unsigned long TURN_FORWARD_MS = 500;
 const unsigned long SEEK_LINE_LOG_MS = 1000;
@@ -42,11 +43,6 @@ enum RobotState {
   STATE_RUNNING,
   STATE_DROPPING,
   STATE_TURNING
-};
-
-enum GapMode {
-  MODE_ADD,
-  MODE_SUB
 };
 
 struct Sensors {
@@ -83,19 +79,16 @@ ButtonState startButton = {
 };
 
 RobotState robotState = STATE_SETTING_TARGET;
-GapMode mode = MODE_ADD;
 
 int targetStation = 0;
-int stationNum = 0;
-int boxNum = 0;
+int pendingGapCount = 0;
 unsigned long lastTargetSelectionTime = 0;
 
 bool straightLineArmed = false;
 bool dumpServoAttached = false;
 bool stationLatched = false;
-bool gapLatched = false;
-bool isTurning = false;
-bool isDropping = false;
+bool gapOpen = false;
+unsigned long gapStartTime = 0;
 
 int readNormalizedSensor(uint8_t pin) {
   int rawValue = digitalRead(pin);
@@ -152,10 +145,6 @@ const char *stateName(RobotState state) {
     default:
       return "UNKNOWN";
   }
-}
-
-const char *modeName(GapMode currentMode) {
-  return currentMode == MODE_ADD ? "ADD" : "SUB";
 }
 
 const char *levelName(bool level) {
@@ -251,13 +240,16 @@ void detachDumpServoIfNeeded() {
   dumpServoAttached = false;
 }
 
+void resetStationCodeTracking() {
+  pendingGapCount = 0;
+  gapOpen = false;
+  gapStartTime = 0;
+}
+
 void resetTripState() {
-  stationNum = 0;
-  boxNum = 0;
-  mode = MODE_ADD;
   straightLineArmed = false;
   stationLatched = false;
-  gapLatched = false;
+  resetStationCodeTracking();
 }
 
 ButtonEvent pollButtonEvent(ButtonState &button, unsigned long longPressMs) {
@@ -375,49 +367,42 @@ void handleRightAngleTurn(bool turnLeft) {
   }
 }
 
-void completeStationIfNeeded() {
-  if (mode != MODE_SUB) {
-    return;
+int decodeStationFromGapCount(int gapCount) {
+  if (gapCount < 1 || gapCount > MAX_TARGET_STATION) {
+    return 0;
   }
 
-  if (boxNum > 0) {
-    return;
-  }
-
-  boxNum = 0;
-  mode = MODE_ADD;
-  Serial.println(F("[MODE] A"));
+  return gapCount;
 }
 
-bool shouldCheckLineEnd() {
-  return stationNum == 3 && boxNum == 0 && mode == MODE_ADD;
+void startGapTracking() {
+  gapOpen = true;
+  gapStartTime = millis();
+  straightLineArmed = false;
 }
 
-bool confirmLineEndCandidate() {
-  unsigned long startTime = millis();
-  Serial.println(F("[END] ?"));
+void handleShortCodeGap(unsigned long gapDurationMs) {
+  gapOpen = false;
+  gapStartTime = 0;
+  pendingGapCount++;
 
-  while (true) {
-    moveForward();
+  printPrefix();
+  Serial.print(F("[CODE] short gap ms="));
+  Serial.print(gapDurationMs);
+  Serial.print(F(" count="));
+  Serial.println(pendingGapCount);
 
-    Sensors s = readSensors();
-    if (!isGapMark(s)) {
-      Serial.println(F("[END] gap"));
-      return false;
-    }
-
-    if (millis() - startTime >= END_CONFIRM_MS) {
-      Serial.println(F("[END] yes"));
-      return true;
-    }
-
-    delay(1);
+  if (gapDurationMs > CODE_GAP_WARN_MS) {
+    printPrefix();
+    Serial.print(F("[WARN] code gap is slower than expected ms="));
+    Serial.println(gapDurationMs);
   }
+
+  delay(SENSOR_EVENT_BLOCK_MS);
 }
 
 void performDropoff() {
   robotState = STATE_DROPPING;
-  isDropping = true;
   Serial.println(F("[DROP] start"));
 
   stopMoving();
@@ -441,14 +426,17 @@ void performDropoff() {
   moveForward();
   delay(DROP_EXIT_MS);
 
-  isDropping = false;
   robotState = STATE_RUNNING;
   Serial.println(F("[DROP] done"));
 }
 
 void performTurnaround() {
   robotState = STATE_TURNING;
-  isTurning = true;
+  unsigned long gapDurationMs = millis() - gapStartTime;
+
+  printPrefix();
+  Serial.print(F("[END] long gap ms="));
+  Serial.println(gapDurationMs);
   Serial.println(F("[TURN] U"));
 
   stopMoving();
@@ -460,51 +448,30 @@ void performTurnaround() {
 
   resetTripState();
   robotState = STATE_RUNNING;
-  isTurning = false;
   Serial.println(F("[TURN] done"));
 }
 
-void handleGapEvent() {
-  straightLineArmed = false;
-
-  if (shouldCheckLineEnd() && confirmLineEndCandidate()) {
-    performTurnaround();
-    return;
-  }
-
-  if (mode == MODE_ADD) {
-    boxNum++;
-  } else if (boxNum > 0) {
-    boxNum--;
-  }
-
-  Serial.print(F("[GAP] "));
-  Serial.print(mode == MODE_ADD ? 'A' : 'S');
-  Serial.print(F(" b="));
-  Serial.println(boxNum);
-
-  completeStationIfNeeded();
-  delay(SENSOR_EVENT_BLOCK_MS);
-}
-
 void handleStationEvent() {
-  int currentStation = boxNum + 1;
-  stationNum++;
   straightLineArmed = false;
+  int decodedStation = decodeStationFromGapCount(pendingGapCount);
 
-  Serial.print(F("[ST] cur="));
-  Serial.print(currentStation);
+  printPrefix();
+  Serial.print(F("[ST] gaps="));
+  Serial.print(pendingGapCount);
+  Serial.print(F(" dec="));
+  Serial.print(stationLabel(decodedStation));
   Serial.print(F(" tgt="));
-  Serial.print(targetStation);
-  Serial.print(F(" s="));
-  Serial.println(stationNum);
+  Serial.println(stationLabel(targetStation));
 
-  if (currentStation == targetStation) {
+  if (decodedStation == 0) {
+    Serial.println(F("[ST] invalid code; ignoring station"));
+  } else if (decodedStation == targetStation) {
     performDropoff();
+  } else {
+    Serial.println(F("[ST] pass"));
   }
 
-  mode = MODE_SUB;
-  completeStationIfNeeded();
+  resetStationCodeTracking();
   delay(SENSOR_EVENT_BLOCK_MS);
 }
 
@@ -603,11 +570,22 @@ void followLine(const Sensors &s) {
 void handleRunning() {
   Sensors s = readSensors();
 
+  if (gapOpen) {
+    unsigned long gapDurationMs = millis() - gapStartTime;
+
+    if (isGapMark(s)) {
+      if (gapDurationMs >= TURNAROUND_GAP_MS) {
+        performTurnaround();
+        return;
+      }
+    } else {
+      handleShortCodeGap(gapDurationMs);
+      return;
+    }
+  }
+
   if (!isStationMark(s)) {
     stationLatched = false;
-  }
-  if (!isGapMark(s)) {
-    gapLatched = false;
   }
 
   if (!stationLatched && isStationMark(s)) {
@@ -616,10 +594,8 @@ void handleRunning() {
     return;
   }
 
-  if (!gapLatched && isGapMark(s)) {
-    gapLatched = true;
-    handleGapEvent();
-    return;
+  if (isGapMark(s) && !gapOpen) {
+    startGapTracking();
   }
 
   followLine(s);
@@ -664,13 +640,13 @@ void printStatus() {
   }
 
   Serial.print(F("[RUN] t="));
-  Serial.print(targetStation);
-  Serial.print(F(" s="));
-  Serial.print(stationNum);
-  Serial.print(F(" b="));
-  Serial.print(boxNum);
-  Serial.print(F(" m="));
-  Serial.print(mode == MODE_ADD ? 'A' : 'S');
+  Serial.print(stationLabel(targetStation));
+  Serial.print(F(" code="));
+  Serial.print(pendingGapCount);
+  if (gapOpen) {
+    Serial.print(F(" gapMs="));
+    Serial.print(millis() - gapStartTime);
+  }
   Serial.print(F(" x="));
   printSensorPattern(s);
   Serial.println();
@@ -700,6 +676,11 @@ void setup() {
   Serial.println(PIN_BTN_START);
   Serial.println(F("[BOOT] sensor raw active-low -> normalized to black=1 white=0"));
   Serial.println(F("[BOOT] input: tap START 1=A 2=B 3=C, hold START to run"));
+  Serial.print(F("[BOOT] code gap warn >"));
+  Serial.print(CODE_GAP_WARN_MS);
+  Serial.print(F(" ms, turnaround gap >= "));
+  Serial.print(TURNAROUND_GAP_MS);
+  Serial.println(F(" ms"));
   printButtonBootState(startButton);
   Serial.println(F("[BOOT] target=none"));
 }
