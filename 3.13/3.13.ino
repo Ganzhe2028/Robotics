@@ -1,25 +1,28 @@
 #include <Servo.h>
 
-// ===== Pin Map =====
-#define PIN_SENSOR_L2 10
-#define PIN_SENSOR_L1 11
-#define PIN_SENSOR_R1 9
-#define PIN_SENSOR_R2 8
+// ===== Hardware Pins =====
+// L2/L1/R1/R2 are kept in the same physical order as the original wiring:
+// left outer, left inner, right inner, right outer.
+#define PIN_SENSOR_LEFT_OUTER 10
+#define PIN_SENSOR_LEFT_INNER 11
+#define PIN_SENSOR_RIGHT_INNER 9
+#define PIN_SENSOR_RIGHT_OUTER 8
 
-#define PIN_SERVO_LEFT 5
-#define PIN_SERVO_RIGHT 4
-#define PIN_SERVO_DUMP 7
+#define PIN_LEFT_SERVO 5
+#define PIN_RIGHT_SERVO 4
+#define PIN_DUMP_SERVO 7
 
-#define PIN_BTN_SELECT 13
-#define PIN_BTN_START 6
+#define PIN_BUTTON_SELECT 13
+#define PIN_BUTTON_START 6
 
-// ===== Logic Level =====
-#define BTN_RELEASED HIGH
-#define BLACK HIGH
-#define WHITE LOW
-#define BTN_PRESSED LOW
+// ===== Logic Levels =====
+#define BUTTON_RELEASED HIGH
+#define BUTTON_PRESSED LOW
 
-// ===== Tunables =====
+#define LINE_BLACK HIGH
+#define LINE_WHITE LOW
+
+// ===== Timing and Motion Constants =====
 const unsigned long LOOP_DELAY_MS = 10;
 const unsigned long BUTTON_DEBOUNCE_MS = 30;
 const unsigned long SENSOR_EVENT_BLOCK_MS = 100;
@@ -35,6 +38,7 @@ const unsigned long STUCK_LOW_WARN_MS = 1500;
 const int DUMP_HOME_ANGLE = 0;
 const int DUMP_RELEASE_ANGLE = 80;
 
+// ===== Robot States =====
 enum RobotState {
   STATE_SETTING_TARGET,
   STATE_RUNNING,
@@ -47,11 +51,12 @@ enum GapMode {
   MODE_SUB
 };
 
-struct Sensors {
-  int l2;
-  int l1;
-  int r1;
-  int r2;
+// ===== Data Structures =====
+struct LineSensors {
+  int leftOuter;
+  int leftInner;
+  int rightInner;
+  int rightOuter;
 };
 
 struct ButtonState {
@@ -59,100 +64,43 @@ struct ButtonState {
   const char *name;
   bool stableLevel;
   bool lastReading;
-  bool pressedArmed;
+  bool releaseArmed;
   bool stuckLowWarned;
   unsigned long stableSinceTime;
   unsigned long lastChangeTime;
 };
 
+// ===== Hardware Objects =====
 Servo leftServo;
 Servo rightServo;
 Servo dumpServo;
 
 ButtonState selectButton = {
-  PIN_BTN_SELECT, "SELECT", BTN_RELEASED, BTN_RELEASED, false, false, 0, 0
+  PIN_BUTTON_SELECT, "SELECT", BUTTON_RELEASED, BUTTON_RELEASED, false, false, 0, 0
 };
 ButtonState startButton = {
-  PIN_BTN_START, "START", BTN_RELEASED, BTN_RELEASED, false, false, 0, 0
+  PIN_BUTTON_START, "START", BUTTON_RELEASED, BUTTON_RELEASED, false, false, 0, 0
 };
 
+// ===== Runtime State =====
 RobotState robotState = STATE_SETTING_TARGET;
-GapMode mode = MODE_ADD;
+GapMode gapMode = MODE_ADD;
 
 int targetStation = 1;
-int stationNum = 0;
-int boxNum = 0;
+int passedStationCount = 0;
+int boxOffset = 0;
 
-bool straightLineArmed = false;
+// A turn signal is only meaningful after the robot has just seen the center line.
+bool turnSignalArmed = false;
 bool dumpServoAttached = false;
-bool stationLatched = false;
-bool gapLatched = false;
-bool isTurning = false;
-bool isDropping = false;
 
-int readNormalizedSensor(uint8_t pin) {
-  int rawValue = digitalRead(pin);
-  return rawValue == HIGH ? WHITE : BLACK;
-}
+// These latches prevent the same solid marker from being counted on every loop.
+bool stationMarkerLatched = false;
+bool gapMarkerLatched = false;
 
-Sensors readSensors() {
-  Sensors s;
-  s.l2 = readNormalizedSensor(PIN_SENSOR_L2);
-  s.l1 = readNormalizedSensor(PIN_SENSOR_L1);
-  s.r1 = readNormalizedSensor(PIN_SENSOR_R1);
-  s.r2 = readNormalizedSensor(PIN_SENSOR_R2);
-  return s;
-}
-
-bool isAllWhite(const Sensors &s) {
-  return s.l2 == WHITE && s.l1 == WHITE && s.r1 == WHITE && s.r2 == WHITE;
-}
-
-bool isAllBlack(const Sensors &s) {
-  return s.l2 == BLACK && s.l1 == BLACK && s.r1 == BLACK && s.r2 == BLACK;
-}
-
-bool isCenterLine(const Sensors &s) {
-  return s.l2 == WHITE && s.l1 == BLACK && s.r1 == BLACK && s.r2 == WHITE;
-}
-
-bool isGapMark(const Sensors &s) {
-  return isAllWhite(s);
-}
-
-bool isStationMark(const Sensors &s) {
-  return isAllBlack(s);
-}
-
-bool isLeftTurnSignal(const Sensors &s) {
-  return s.l2 == BLACK && s.r2 == WHITE && !isStationMark(s);
-}
-
-bool isRightTurnSignal(const Sensors &s) {
-  return s.l2 == WHITE && s.r2 == BLACK && !isStationMark(s);
-}
-
-const char *stateName(RobotState state) {
-  switch (state) {
-    case STATE_SETTING_TARGET:
-      return "SETTING_TARGET";
-    case STATE_RUNNING:
-      return "RUNNING";
-    case STATE_DROPPING:
-      return "DROPPING";
-    case STATE_TURNING:
-      return "TURNING";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-const char *modeName(GapMode currentMode) {
-  return currentMode == MODE_ADD ? "ADD" : "SUB";
-}
-
+// ===== Debug Print Helpers =====
 const char *levelName(bool level) {
-  return level == BTN_PRESSED ? "LOW/PRESSED" : "HIGH/RELEASED";
+  return level == BUTTON_PRESSED ? "LOW/PRESSED" : "HIGH/RELEASED";
 }
 
 void printPrefix() {
@@ -161,14 +109,11 @@ void printPrefix() {
   Serial.print(F(" ms] "));
 }
 
-void setupButton(ButtonState &button) {
-  pinMode(button.pin, INPUT_PULLUP);
-  button.stableLevel = digitalRead(button.pin);
-  button.lastReading = button.stableLevel;
-  button.pressedArmed = false;
-  button.stuckLowWarned = false;
-  button.stableSinceTime = millis();
-  button.lastChangeTime = millis();
+void printSensorPattern(const LineSensors &sensors) {
+  Serial.print(sensors.leftOuter);
+  Serial.print(sensors.leftInner);
+  Serial.print(sensors.rightInner);
+  Serial.print(sensors.rightOuter);
 }
 
 void printButtonBootState(const ButtonState &button) {
@@ -178,13 +123,69 @@ void printButtonBootState(const ButtonState &button) {
   Serial.println(levelName(button.stableLevel));
 }
 
-void printSensorPattern(const Sensors &s) {
-  Serial.print(s.l2);
-  Serial.print(s.l1);
-  Serial.print(s.r1);
-  Serial.print(s.r2);
+// ===== Sensor Reading and Pattern Checks =====
+// The sensors are wired active-low, so raw HIGH means white floor and raw LOW
+// means black tape. The rest of the program works with the normalized values.
+int readNormalizedLineSensor(uint8_t pin) {
+  int rawValue = digitalRead(pin);
+  return rawValue == HIGH ? LINE_WHITE : LINE_BLACK;
 }
 
+LineSensors readLineSensors() {
+  LineSensors sensors;
+  sensors.leftOuter = readNormalizedLineSensor(PIN_SENSOR_LEFT_OUTER);
+  sensors.leftInner = readNormalizedLineSensor(PIN_SENSOR_LEFT_INNER);
+  sensors.rightInner = readNormalizedLineSensor(PIN_SENSOR_RIGHT_INNER);
+  sensors.rightOuter = readNormalizedLineSensor(PIN_SENSOR_RIGHT_OUTER);
+  return sensors;
+}
+
+bool isAllWhite(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_WHITE &&
+         sensors.leftInner == LINE_WHITE &&
+         sensors.rightInner == LINE_WHITE &&
+         sensors.rightOuter == LINE_WHITE;
+}
+
+bool isAllBlack(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_BLACK &&
+         sensors.leftInner == LINE_BLACK &&
+         sensors.rightInner == LINE_BLACK &&
+         sensors.rightOuter == LINE_BLACK;
+}
+
+bool isCenterLine(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_WHITE &&
+         sensors.leftInner == LINE_BLACK &&
+         sensors.rightInner == LINE_BLACK &&
+         sensors.rightOuter == LINE_WHITE;
+}
+
+bool isGapMark(const LineSensors &sensors) {
+  return isAllWhite(sensors);
+}
+
+bool isStationMark(const LineSensors &sensors) {
+  return isAllBlack(sensors);
+}
+
+bool isLeftTurnSignal(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_BLACK &&
+         sensors.rightOuter == LINE_WHITE &&
+         !isStationMark(sensors);
+}
+
+bool isRightTurnSignal(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_WHITE &&
+         sensors.rightOuter == LINE_BLACK &&
+         !isStationMark(sensors);
+}
+
+bool areOuterSensorsWhite(const LineSensors &sensors) {
+  return sensors.leftOuter == LINE_WHITE && sensors.rightOuter == LINE_WHITE;
+}
+
+// ===== Drive Helpers =====
 void stopMoving() {
   leftServo.write(90);
   rightServo.write(90);
@@ -220,7 +221,7 @@ void attachDumpServoIfNeeded() {
     return;
   }
 
-  dumpServo.attach(PIN_SERVO_DUMP);
+  dumpServo.attach(PIN_DUMP_SERVO);
   dumpServoAttached = true;
   dumpServo.write(DUMP_HOME_ANGLE);
   delay(120);
@@ -235,15 +236,19 @@ void detachDumpServoIfNeeded() {
   dumpServoAttached = false;
 }
 
-void resetTripState() {
-  stationNum = 0;
-  boxNum = 0;
-  mode = MODE_ADD;
-  straightLineArmed = false;
-  stationLatched = false;
-  gapLatched = false;
+// ===== Button Helpers =====
+void setupButton(ButtonState &button) {
+  pinMode(button.pin, INPUT_PULLUP);
+  button.stableLevel = digitalRead(button.pin);
+  button.lastReading = button.stableLevel;
+  button.releaseArmed = false;
+  button.stuckLowWarned = false;
+  button.stableSinceTime = millis();
+  button.lastChangeTime = millis();
 }
 
+// A button event happens on a stable release, not on the initial press.
+// This avoids repeated triggers while the button is still being held down.
 bool pollButtonReleaseEvent(ButtonState &button) {
   bool reading = digitalRead(button.pin);
 
@@ -264,25 +269,25 @@ bool pollButtonReleaseEvent(ButtonState &button) {
   button.stableSinceTime = millis();
   button.stuckLowWarned = false;
 
-  if (button.stableLevel == BTN_PRESSED) {
-    button.pressedArmed = true;
+  if (button.stableLevel == BUTTON_PRESSED) {
+    button.releaseArmed = true;
     return false;
   }
 
-  if (!button.pressedArmed) {
+  if (!button.releaseArmed) {
     return false;
   }
 
-  button.pressedArmed = false;
+  button.releaseArmed = false;
   return true;
 }
 
 void warnIfButtonStuck(ButtonState &button) {
-  if (button.stableLevel != BTN_PRESSED) {
+  if (button.stableLevel != BUTTON_PRESSED) {
     return;
   }
 
-  if (button.pressedArmed) {
+  if (button.releaseArmed) {
     return;
   }
 
@@ -302,6 +307,58 @@ void warnIfButtonStuck(ButtonState &button) {
   Serial.println(F(" held LOW without an edge; check wiring, switch, or pin choice"));
 }
 
+// ===== Mission State Helpers =====
+void resetTripState() {
+  passedStationCount = 0;
+  boxOffset = 0;
+  gapMode = MODE_ADD;
+  turnSignalArmed = false;
+  stationMarkerLatched = false;
+  gapMarkerLatched = false;
+}
+
+void finishSubModeIfNeeded() {
+  if (gapMode != MODE_SUB) {
+    return;
+  }
+
+  if (boxOffset > 0) {
+    return;
+  }
+
+  boxOffset = 0;
+  gapMode = MODE_ADD;
+  Serial.println(F("[MODE] A"));
+}
+
+bool shouldCheckLineEnd() {
+  return passedStationCount == 3 && boxOffset == 0 && gapMode == MODE_ADD;
+}
+
+// The robot only treats a long all-white region as the end of the line after
+// reaching the final station and returning to the first box lane.
+bool confirmLineEndCandidate() {
+  unsigned long startTime = millis();
+  Serial.println(F("[END] ?"));
+
+  while (true) {
+    moveForward();
+
+    LineSensors sensors = readLineSensors();
+    if (!isGapMark(sensors)) {
+      Serial.println(F("[END] gap"));
+      return false;
+    }
+
+    if (millis() - startTime >= END_CONFIRM_MS) {
+      Serial.println(F("[END] yes"));
+      return true;
+    }
+
+    delay(1);
+  }
+}
+
 void rotateUntilLineFound(bool turnLeft) {
   unsigned long lastLogTime = millis();
 
@@ -312,8 +369,8 @@ void rotateUntilLineFound(bool turnLeft) {
       turnRightHard();
     }
 
-    Sensors s = readSensors();
-    if (s.l1 == BLACK || s.r1 == BLACK) {
+    LineSensors sensors = readLineSensors();
+    if (sensors.leftInner == LINE_BLACK || sensors.rightInner == LINE_BLACK) {
       Serial.println(F("[SEEK] line found"));
       return;
     }
@@ -332,69 +389,28 @@ void handleRightAngleTurn(bool turnLeft) {
   moveForward();
   delay(TURN_FORWARD_MS);
 
-  Sensors s = readSensors();
-  if (isAllWhite(s)) {
+  LineSensors sensors = readLineSensors();
+  if (isAllWhite(sensors)) {
     rotateUntilLineFound(turnLeft);
-  }
-}
-
-void completeStationIfNeeded() {
-  if (mode != MODE_SUB) {
-    return;
-  }
-
-  if (boxNum > 0) {
-    return;
-  }
-
-  boxNum = 0;
-  mode = MODE_ADD;
-  Serial.println(F("[MODE] A"));
-}
-
-bool shouldCheckLineEnd() {
-  return stationNum == 3 && boxNum == 0 && mode == MODE_ADD;
-}
-
-bool confirmLineEndCandidate() {
-  unsigned long startTime = millis();
-  Serial.println(F("[END] ?"));
-
-  while (true) {
-    moveForward();
-
-    Sensors s = readSensors();
-    if (!isGapMark(s)) {
-      Serial.println(F("[END] gap"));
-      return false;
-    }
-
-    if (millis() - startTime >= END_CONFIRM_MS) {
-      Serial.println(F("[END] yes"));
-      return true;
-    }
-
-    delay(1);
   }
 }
 
 void performDropoff() {
   robotState = STATE_DROPPING;
-  isDropping = true;
   Serial.println(F("[DROP] start"));
 
   stopMoving();
   attachDumpServoIfNeeded();
 
-  for (int pos = DUMP_HOME_ANGLE; pos <= DUMP_RELEASE_ANGLE; pos++) {
-    dumpServo.write(pos);
+  for (int position = DUMP_HOME_ANGLE; position <= DUMP_RELEASE_ANGLE; position++) {
+    dumpServo.write(position);
     delay(10);
   }
 
   delay(DROP_PAYLOAD_MS);
 
-  for (int pos = DUMP_RELEASE_ANGLE; pos >= DUMP_HOME_ANGLE; pos--) {
-    dumpServo.write(pos);
+  for (int position = DUMP_RELEASE_ANGLE; position >= DUMP_HOME_ANGLE; position--) {
+    dumpServo.write(position);
     delay(10);
   }
 
@@ -404,14 +420,12 @@ void performDropoff() {
   moveForward();
   delay(DROP_EXIT_MS);
 
-  isDropping = false;
   robotState = STATE_RUNNING;
   Serial.println(F("[DROP] done"));
 }
 
 void performTurnaround() {
   robotState = STATE_TURNING;
-  isTurning = true;
   Serial.println(F("[TURN] U"));
 
   stopMoving();
@@ -423,51 +437,50 @@ void performTurnaround() {
 
   resetTripState();
   robotState = STATE_RUNNING;
-  isTurning = false;
   Serial.println(F("[TURN] done"));
 }
 
 void handleGapEvent() {
-  straightLineArmed = false;
+  turnSignalArmed = false;
 
   if (shouldCheckLineEnd() && confirmLineEndCandidate()) {
     performTurnaround();
     return;
   }
 
-  if (mode == MODE_ADD) {
-    boxNum++;
-  } else if (boxNum > 0) {
-    boxNum--;
+  if (gapMode == MODE_ADD) {
+    boxOffset++;
+  } else if (boxOffset > 0) {
+    boxOffset--;
   }
 
   Serial.print(F("[GAP] "));
-  Serial.print(mode == MODE_ADD ? 'A' : 'S');
+  Serial.print(gapMode == MODE_ADD ? 'A' : 'S');
   Serial.print(F(" b="));
-  Serial.println(boxNum);
+  Serial.println(boxOffset);
 
-  completeStationIfNeeded();
+  finishSubModeIfNeeded();
   delay(SENSOR_EVENT_BLOCK_MS);
 }
 
 void handleStationEvent() {
-  int currentStation = boxNum + 1;
-  stationNum++;
-  straightLineArmed = false;
+  int currentStation = boxOffset + 1;
+  passedStationCount++;
+  turnSignalArmed = false;
 
   Serial.print(F("[ST] cur="));
   Serial.print(currentStation);
   Serial.print(F(" tgt="));
   Serial.print(targetStation);
   Serial.print(F(" s="));
-  Serial.println(stationNum);
+  Serial.println(passedStationCount);
 
   if (currentStation == targetStation) {
     performDropoff();
   }
 
-  mode = MODE_SUB;
-  completeStationIfNeeded();
+  gapMode = MODE_SUB;
+  finishSubModeIfNeeded();
   delay(SENSOR_EVENT_BLOCK_MS);
 }
 
@@ -478,6 +491,101 @@ void beginRunning() {
   Serial.println(targetStation);
 }
 
+// ===== Running Logic =====
+void updateTurnSignalArm(const LineSensors &sensors) {
+  if (isCenterLine(sensors)) {
+    turnSignalArmed = true;
+  }
+}
+
+bool handleTurnSignal(const LineSensors &sensors) {
+  if (!turnSignalArmed) {
+    return false;
+  }
+
+  if (isLeftTurnSignal(sensors)) {
+    turnSignalArmed = false;
+    handleRightAngleTurn(true);
+    return true;
+  }
+
+  if (isRightTurnSignal(sensors)) {
+    turnSignalArmed = false;
+    handleRightAngleTurn(false);
+    return true;
+  }
+
+  return false;
+}
+
+void applyLineFollowingMotion(const LineSensors &sensors) {
+  if (!areOuterSensorsWhite(sensors)) {
+    stopMoving();
+    return;
+  }
+
+  if (sensors.leftInner == LINE_BLACK && sensors.rightInner == LINE_BLACK) {
+    moveForward();
+  } else if (sensors.leftInner == LINE_BLACK && sensors.rightInner == LINE_WHITE) {
+    turnLeftSoft();
+  } else if (sensors.leftInner == LINE_WHITE && sensors.rightInner == LINE_BLACK) {
+    turnRightSoft();
+  } else if (isAllWhite(sensors)) {
+    moveForward();
+  } else {
+    stopMoving();
+  }
+}
+
+void followLine(const LineSensors &sensors) {
+  updateTurnSignalArm(sensors);
+
+  if (handleTurnSignal(sensors)) {
+    return;
+  }
+
+  applyLineFollowingMotion(sensors);
+}
+
+void releaseMarkerLatchesIfNeeded(const LineSensors &sensors) {
+  if (!isStationMark(sensors)) {
+    stationMarkerLatched = false;
+  }
+
+  if (!isGapMark(sensors)) {
+    gapMarkerLatched = false;
+  }
+}
+
+bool handleMarkersIfDetected(const LineSensors &sensors) {
+  if (!stationMarkerLatched && isStationMark(sensors)) {
+    stationMarkerLatched = true;
+    handleStationEvent();
+    return true;
+  }
+
+  if (!gapMarkerLatched && isGapMark(sensors)) {
+    gapMarkerLatched = true;
+    handleGapEvent();
+    return true;
+  }
+
+  return false;
+}
+
+void handleRunning() {
+  LineSensors sensors = readLineSensors();
+
+  releaseMarkerLatchesIfNeeded(sensors);
+
+  if (handleMarkersIfDetected(sensors)) {
+    return;
+  }
+
+  followLine(sensors);
+}
+
+// ===== Target Selection State =====
 void handleSettingTarget() {
   stopMoving();
 
@@ -494,10 +602,10 @@ void handleSettingTarget() {
     return;
   }
 
-  Sensors s = readSensors();
-  if (!isCenterLine(s)) {
+  LineSensors sensors = readLineSensors();
+  if (!isCenterLine(sensors)) {
     Serial.print(F("[READY] need 0110 got "));
-    printSensorPattern(s);
+    printSensorPattern(sensors);
     Serial.println();
     return;
   }
@@ -505,66 +613,7 @@ void handleSettingTarget() {
   beginRunning();
 }
 
-void followLine(const Sensors &s) {
-  if (isCenterLine(s)) {
-    straightLineArmed = true;
-  }
-
-  if (straightLineArmed && isLeftTurnSignal(s)) {
-    straightLineArmed = false;
-    handleRightAngleTurn(true);
-    return;
-  }
-
-  if (straightLineArmed && isRightTurnSignal(s)) {
-    straightLineArmed = false;
-    handleRightAngleTurn(false);
-    return;
-  }
-
-  if (s.l2 == WHITE && s.r2 == WHITE) {
-    if (s.l1 == BLACK && s.r1 == BLACK) {
-      moveForward();
-    } else if (s.l1 == BLACK && s.r1 == WHITE) {
-      turnLeftSoft();
-    } else if (s.l1 == WHITE && s.r1 == BLACK) {
-      turnRightSoft();
-    } else if (isAllWhite(s)) {
-      moveForward();
-    } else {
-      stopMoving();
-    }
-    return;
-  }
-
-  stopMoving();
-}
-
-void handleRunning() {
-  Sensors s = readSensors();
-
-  if (!isStationMark(s)) {
-    stationLatched = false;
-  }
-  if (!isGapMark(s)) {
-    gapLatched = false;
-  }
-
-  if (!stationLatched && isStationMark(s)) {
-    stationLatched = true;
-    handleStationEvent();
-    return;
-  }
-
-  if (!gapLatched && isGapMark(s)) {
-    gapLatched = true;
-    handleGapEvent();
-    return;
-  }
-
-  followLine(s);
-}
-
+// ===== Status Printing =====
 void printStatus() {
   static unsigned long lastPrintTime = 0;
 
@@ -573,14 +622,14 @@ void printStatus() {
   }
 
   lastPrintTime = millis();
-  Sensors s = readSensors();
+  LineSensors sensors = readLineSensors();
 
   if (robotState == STATE_SETTING_TARGET) {
     Serial.print(F("[READY] t="));
     Serial.print(targetStation);
     Serial.print(F(" s="));
-    printSensorPattern(s);
-    Serial.println(isCenterLine(s) ? F(" ok") : F(" wait"));
+    printSensorPattern(sensors);
+    Serial.println(isCenterLine(sensors) ? F(" ok") : F(" wait"));
     return;
   }
 
@@ -591,46 +640,63 @@ void printStatus() {
   Serial.print(F("[RUN] t="));
   Serial.print(targetStation);
   Serial.print(F(" s="));
-  Serial.print(stationNum);
+  Serial.print(passedStationCount);
   Serial.print(F(" b="));
-  Serial.print(boxNum);
+  Serial.print(boxOffset);
   Serial.print(F(" m="));
-  Serial.print(mode == MODE_ADD ? 'A' : 'S');
+  Serial.print(gapMode == MODE_ADD ? 'A' : 'S');
   Serial.print(F(" x="));
-  printSensorPattern(s);
+  printSensorPattern(sensors);
   Serial.println();
 }
 
-void setup() {
-  Serial.begin(9600);
-  Serial.println(F("[BOOT] init"));
+// ===== Setup Helpers =====
+void setupSensorPins() {
+  pinMode(PIN_SENSOR_LEFT_OUTER, INPUT);
+  pinMode(PIN_SENSOR_LEFT_INNER, INPUT);
+  pinMode(PIN_SENSOR_RIGHT_INNER, INPUT);
+  pinMode(PIN_SENSOR_RIGHT_OUTER, INPUT);
+}
 
-  pinMode(PIN_SENSOR_L2, INPUT);
-  pinMode(PIN_SENSOR_L1, INPUT);
-  pinMode(PIN_SENSOR_R1, INPUT);
-  pinMode(PIN_SENSOR_R2, INPUT);
-
+void setupButtons() {
   setupButton(selectButton);
   setupButton(startButton);
+}
 
-  leftServo.attach(PIN_SERVO_LEFT);
-  rightServo.attach(PIN_SERVO_RIGHT);
+void setupDriveServos() {
+  leftServo.attach(PIN_LEFT_SERVO);
+  rightServo.attach(PIN_RIGHT_SERVO);
   stopMoving();
+}
 
+void setupDumpServo() {
   dumpServo.detach();
   dumpServoAttached = false;
+}
 
-  resetTripState();
-
+void printBootMessages() {
   Serial.print(F("[BOOT] btn start="));
-  Serial.print(PIN_BTN_START);
+  Serial.print(PIN_BUTTON_START);
   Serial.print(F(" select="));
-  Serial.println(PIN_BTN_SELECT);
+  Serial.println(PIN_BUTTON_SELECT);
   Serial.println(F("[BOOT] sensor raw active-low -> normalized to black=1 white=0"));
   Serial.println(F("[BOOT] button event = stable release"));
   printButtonBootState(startButton);
   printButtonBootState(selectButton);
   Serial.println(F("[BOOT] target=1"));
+}
+
+// ===== Arduino Entry Points =====
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("[BOOT] init"));
+
+  setupSensorPins();
+  setupButtons();
+  setupDriveServos();
+  setupDumpServo();
+  resetTripState();
+  printBootMessages();
 }
 
 void loop() {
