@@ -842,6 +842,11 @@ void handleRunning() {
     return;
   }
 
+  if (stationLatched && isStationMark(s)) {
+    moveForward();
+    return;
+  }
+
   followLine(s);
 }
 

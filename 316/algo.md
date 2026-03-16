@@ -11,6 +11,7 @@
 
 - `1111` is the station mark.
 - `0000` first becomes a `gap candidate`, not an immediate gap count.
+- If the current station has already been handled and the robot is still physically on `1111`, the drive logic keeps pushing forward instead of stopping on the black bar.
 - If the white region ends before `END_CONFIRM_MS`, it is resolved as a normal gap.
 - If the white region lasts longer than `END_CONFIRM_MS`, the code checks whether a turnaround is actually allowed before treating it as the line end.
 
