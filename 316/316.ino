@@ -113,6 +113,7 @@ int passedStationCount = 0;
 int boxOffset = 0;
 int lastConfirmedStation = 0;
 unsigned long lastTargetSelectionTime = 0;
+bool targetServedThisLeg = false;
 
 bool straightLineArmed = false;
 bool dumpServoAttached = false;
@@ -292,6 +293,7 @@ void resetTripState() {
   gapMode = MODE_ADD;
   passedStationCount = 0;
   boxOffset = 0;
+  targetServedThisLeg = false;
   straightLineArmed = false;
   stationLatched = false;
   gapLatched = false;
@@ -314,7 +316,13 @@ void updateTravelDirection(int currentStation) {
     return;
   }
 
-  if (isValidStationNumber(lastConfirmedStation)) {
+  if (!isValidStationNumber(lastConfirmedStation)) {
+    if (currentStation == 1) {
+      travelDirection = DIR_TO_C;
+    } else if (currentStation == MAX_TARGET_STATION) {
+      travelDirection = DIR_TO_A;
+    }
+  } else {
     if (currentStation > lastConfirmedStation) {
       travelDirection = DIR_TO_C;
     } else if (currentStation < lastConfirmedStation) {
@@ -588,10 +596,14 @@ void handleStationEvent() {
   Serial.print(F(" x=1111"));
   Serial.println();
 
-  if (currentStation == targetStation) {
+  if (currentStation == targetStation && !targetServedThisLeg) {
+    targetServedThisLeg = true;
     printPrefix();
     Serial.println(F("[ST] station match -> drop"));
     performDropoff();
+  } else if (currentStation == targetStation) {
+    printPrefix();
+    Serial.println(F("[ST] target already served this leg -> pass"));
   } else {
     printPrefix();
     Serial.println(F("[ST] station pass"));
@@ -744,13 +756,12 @@ bool handleGapCandidate(const Sensors &s) {
   }
 
   if (gapCandidateLong) {
-    gapCandidateActive = false;
-    gapCandidateLong = false;
     printPrefix();
-    Serial.print(F("[GAP] long candidate canceled x="));
+    Serial.print(F("[GAP] long candidate -> gap x="));
     printSensorPattern(s);
     Serial.println();
-    return false;
+    handleGapEvent();
+    return true;
   }
 
   if (!isTrackRecoveredPattern(s) && !isStationMark(s)) {
@@ -900,6 +911,8 @@ void printStatus() {
   Serial.print(stationLabel(lastConfirmedStation));
   Serial.print(F(" dir="));
   Serial.print(directionName(travelDirection));
+  Serial.print(F(" served="));
+  Serial.print(targetServedThisLeg ? 1 : 0);
   Serial.print(F(" arm="));
   Serial.print(straightLineArmed ? 1 : 0);
   if (gapCandidateActive) {

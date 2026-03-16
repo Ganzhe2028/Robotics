@@ -18,13 +18,21 @@
 ## Turnaround gating
 
 - The sketch tracks the last confirmed station and inferred travel direction.
-- Direction is inferred only after at least two valid stations establish order:
-  - increasing station order means `TO_C`
-  - decreasing station order means `TO_A`
+- Direction is inferred from station order:
+  - first confirmed `A` implies `TO_C`
+  - first confirmed `C` implies `TO_A`
+  - later increasing station order keeps/sets `TO_C`
+  - later decreasing station order keeps/sets `TO_A`
 - A long white region can trigger turnaround only when:
   - direction is `TO_A` and the last confirmed station is `A`, or
   - direction is `TO_C` and the last confirmed station is `C`
 - This prevents ordinary off-line white regions from being misread as the terminal end.
+
+## Target drop policy
+
+- The target station is served at most once per leg.
+- After one successful drop, later sightings of the same target station in the same leg are forced to `pass`.
+- The flag resets only after a confirmed turnaround.
 
 ## Debug output
 
@@ -40,9 +48,9 @@
   - `[TURN] canceled by station`
   - `[ST] station detected`
   - `[GAP] candidate`
-  - `[END] confirmed ...`
-  - `[END] blocked ...`
-  - `[GAP] long candidate canceled ...`
+- `[END] confirmed ...`
+- `[END] blocked ...`
+- `[GAP] long candidate -> gap ...`
 
 ## Tuning points
 
