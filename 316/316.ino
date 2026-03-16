@@ -65,6 +65,12 @@ enum GapMode {
   MODE_SUB
 };
 
+enum TravelDirection {
+  DIR_UNKNOWN,
+  DIR_TO_A,
+  DIR_TO_C
+};
+
 struct Sensors {
   int l2;
   int l1;
@@ -100,18 +106,25 @@ ButtonState startButton = {
 
 RobotState robotState = STATE_SETTING_TARGET;
 GapMode gapMode = MODE_ADD;
+TravelDirection travelDirection = DIR_UNKNOWN;
 
 int targetStation = 0;
 int passedStationCount = 0;
 int boxOffset = 0;
+int lastConfirmedStation = 0;
 unsigned long lastTargetSelectionTime = 0;
 
 bool straightLineArmed = false;
 bool dumpServoAttached = false;
 bool stationLatched = false;
 bool gapLatched = false;
+bool stationArmed = true;
+bool gapArmed = true;
+bool gapCandidateActive = false;
+bool gapCandidateLong = false;
 unsigned long lastGapEventTime = 0;
 unsigned long lastStationEventTime = 0;
+unsigned long gapCandidateStartTime = 0;
 
 int readNormalizedSensor(uint8_t pin) {
   int rawValue = digitalRead(pin);
@@ -143,6 +156,10 @@ bool areOuterSensorsWhite(const Sensors &s) {
   return s.l2 == WHITE && s.r2 == WHITE;
 }
 
+bool isTrackRecoveredPattern(const Sensors &s) {
+  return areOuterSensorsWhite(s) && (s.l1 == BLACK || s.r1 == BLACK);
+}
+
 bool isGapMark(const Sensors &s) {
   return isAllWhite(s);
 }
@@ -171,8 +188,24 @@ const char *modeName(GapMode mode) {
   return mode == MODE_ADD ? "ADD" : "SUB";
 }
 
+const char *directionName(TravelDirection direction) {
+  if (direction == DIR_TO_A) {
+    return "TO_A";
+  }
+
+  if (direction == DIR_TO_C) {
+    return "TO_C";
+  }
+
+  return "UNKNOWN";
+}
+
 const char *levelName(bool level) {
   return level == BTN_PRESSED ? "LOW/PRESSED" : "HIGH/RELEASED";
+}
+
+bool isValidStationNumber(int station) {
+  return station >= 1 && station <= MAX_TARGET_STATION;
 }
 
 void printPrefix() {
@@ -262,8 +295,64 @@ void resetTripState() {
   straightLineArmed = false;
   stationLatched = false;
   gapLatched = false;
+  stationArmed = true;
+  gapArmed = true;
+  gapCandidateActive = false;
+  gapCandidateLong = false;
   lastGapEventTime = 0;
   lastStationEventTime = 0;
+  gapCandidateStartTime = 0;
+}
+
+void resetNavigationState() {
+  travelDirection = DIR_UNKNOWN;
+  lastConfirmedStation = 0;
+}
+
+void updateTravelDirection(int currentStation) {
+  if (!isValidStationNumber(currentStation)) {
+    return;
+  }
+
+  if (isValidStationNumber(lastConfirmedStation)) {
+    if (currentStation > lastConfirmedStation) {
+      travelDirection = DIR_TO_C;
+    } else if (currentStation < lastConfirmedStation) {
+      travelDirection = DIR_TO_A;
+    }
+  }
+
+  lastConfirmedStation = currentStation;
+}
+
+bool shouldAllowTurnaround() {
+  if (travelDirection == DIR_TO_A && lastConfirmedStation == 1) {
+    return true;
+  }
+
+  if (travelDirection == DIR_TO_C && lastConfirmedStation == MAX_TARGET_STATION) {
+    return true;
+  }
+
+  return false;
+}
+
+void updateDirectionAfterTurnaround() {
+  if (lastConfirmedStation == 1) {
+    travelDirection = DIR_TO_C;
+    return;
+  }
+
+  if (lastConfirmedStation == MAX_TARGET_STATION) {
+    travelDirection = DIR_TO_A;
+    return;
+  }
+
+  if (travelDirection == DIR_TO_A) {
+    travelDirection = DIR_TO_C;
+  } else if (travelDirection == DIR_TO_C) {
+    travelDirection = DIR_TO_A;
+  }
 }
 
 ButtonEvent pollButtonEvent(ButtonState &button, unsigned long longPressMs) {
@@ -397,36 +486,15 @@ void finishSubModeIfNeeded() {
   Serial.println(F("[MODE] add"));
 }
 
-bool shouldCheckLineEnd() {
-  return passedStationCount == MAX_TARGET_STATION && boxOffset == 0 && gapMode == MODE_ADD;
-}
-
-bool confirmLineEndCandidate() {
-  unsigned long startTime = millis();
+void startGapCandidate() {
+  gapCandidateActive = true;
+  gapCandidateLong = false;
+  gapCandidateStartTime = millis();
+  straightLineArmed = false;
+  gapArmed = false;
 
   printPrefix();
-  Serial.println(F("[END] candidate"));
-
-  while (true) {
-    moveForward();
-
-    Sensors s = readSensors();
-    if (!isGapMark(s)) {
-      printPrefix();
-      Serial.print(F("[END] rejected x="));
-      printSensorPattern(s);
-      Serial.println();
-      return false;
-    }
-
-    if (millis() - startTime >= END_CONFIRM_MS) {
-      printPrefix();
-      Serial.println(F("[END] confirmed"));
-      return true;
-    }
-
-    delay(1);
-  }
+  Serial.println(F("[GAP] candidate"));
 }
 
 void performDropoff() {
@@ -469,6 +537,7 @@ void performTurnaround() {
   moveForward();
   delay(DROP_EXIT_MS);
 
+  updateDirectionAfterTurnaround();
   resetTripState();
   robotState = STATE_RUNNING;
   Serial.println(F("[TURN] done"));
@@ -477,11 +546,9 @@ void performTurnaround() {
 void handleGapEvent() {
   straightLineArmed = false;
   lastGapEventTime = millis();
-
-  if (shouldCheckLineEnd() && confirmLineEndCandidate()) {
-    performTurnaround();
-    return;
-  }
+  gapArmed = false;
+  gapCandidateActive = false;
+  gapCandidateLong = false;
 
   if (gapMode == MODE_ADD) {
     boxOffset++;
@@ -506,6 +573,8 @@ void handleStationEvent() {
   passedStationCount++;
   straightLineArmed = false;
   lastStationEventTime = millis();
+  stationArmed = false;
+  updateTravelDirection(currentStation);
 
   printPrefix();
   Serial.print(F("[ST] station detected cur="));
@@ -535,6 +604,7 @@ void handleStationEvent() {
 
 void beginRunning() {
   resetTripState();
+  resetNavigationState();
   robotState = STATE_RUNNING;
   Serial.print(F("[RUN] start t="));
   Serial.print(stationLabel(targetStation));
@@ -642,6 +712,56 @@ bool confirmTurnSignal(bool turnLeft) {
   return false;
 }
 
+bool handleGapCandidate(const Sensors &s) {
+  if (!gapCandidateActive) {
+    return false;
+  }
+
+  if (isGapMark(s)) {
+    moveForward();
+
+    if (!gapCandidateLong &&
+        millis() - gapCandidateStartTime >= END_CONFIRM_MS) {
+      if (shouldAllowTurnaround()) {
+        printPrefix();
+        Serial.print(F("[END] confirmed last="));
+        Serial.print(stationLabel(lastConfirmedStation));
+        Serial.print(F(" dir="));
+        Serial.println(directionName(travelDirection));
+        gapCandidateActive = false;
+        performTurnaround();
+      } else {
+        gapCandidateLong = true;
+        printPrefix();
+        Serial.print(F("[END] blocked last="));
+        Serial.print(stationLabel(lastConfirmedStation));
+        Serial.print(F(" dir="));
+        Serial.println(directionName(travelDirection));
+      }
+    }
+
+    return true;
+  }
+
+  if (gapCandidateLong) {
+    gapCandidateActive = false;
+    gapCandidateLong = false;
+    printPrefix();
+    Serial.print(F("[GAP] long candidate canceled x="));
+    printSensorPattern(s);
+    Serial.println();
+    return false;
+  }
+
+  if (!isTrackRecoveredPattern(s) && !isStationMark(s)) {
+    applyLineFollowingMotion(s);
+    return true;
+  }
+
+  handleGapEvent();
+  return true;
+}
+
 void followLine(const Sensors &s) {
   if (isCenterLine(s)) {
     straightLineArmed = true;
@@ -667,6 +787,14 @@ void followLine(const Sensors &s) {
 }
 
 void releaseMarkerLatchesIfNeeded(const Sensors &s) {
+  if (isTrackRecoveredPattern(s)) {
+    stationLatched = false;
+    gapLatched = false;
+    stationArmed = true;
+    gapArmed = true;
+    return;
+  }
+
   if (stationLatched && (areOuterSensorsWhite(s) || isGapMark(s))) {
     stationLatched = false;
   }
@@ -677,21 +805,24 @@ void releaseMarkerLatchesIfNeeded(const Sensors &s) {
 }
 
 bool handleMarkersIfDetected(const Sensors &s) {
+  if (!gapCandidateActive &&
+      gapArmed &&
+      !gapLatched &&
+      isGapMark(s) &&
+      (lastGapEventTime == 0 ||
+       millis() - lastGapEventTime >= GAP_EVENT_COOLDOWN_MS)) {
+    gapLatched = true;
+    startGapCandidate();
+    return true;
+  }
+
   if (!stationLatched &&
+      stationArmed &&
       isStationMark(s) &&
       (lastStationEventTime == 0 ||
        millis() - lastStationEventTime >= STATION_EVENT_COOLDOWN_MS)) {
     stationLatched = true;
     handleStationEvent();
-    return true;
-  }
-
-  if (!gapLatched &&
-      isGapMark(s) &&
-      (lastGapEventTime == 0 ||
-       millis() - lastGapEventTime >= GAP_EVENT_COOLDOWN_MS)) {
-    gapLatched = true;
-    handleGapEvent();
     return true;
   }
 
@@ -702,6 +833,10 @@ void handleRunning() {
   Sensors s = readSensors();
 
   releaseMarkerLatchesIfNeeded(s);
+
+  if (handleGapCandidate(s)) {
+    return;
+  }
 
   if (handleMarkersIfDetected(s)) {
     return;
@@ -756,8 +891,16 @@ void printStatus() {
   Serial.print(boxOffset);
   Serial.print(F(" pass="));
   Serial.print(passedStationCount);
+  Serial.print(F(" last="));
+  Serial.print(stationLabel(lastConfirmedStation));
+  Serial.print(F(" dir="));
+  Serial.print(directionName(travelDirection));
   Serial.print(F(" arm="));
   Serial.print(straightLineArmed ? 1 : 0);
+  if (gapCandidateActive) {
+    Serial.print(F(" gapMs="));
+    Serial.print(millis() - gapCandidateStartTime);
+  }
   Serial.print(F(" x="));
   printSensorPattern(s);
   Serial.println();
