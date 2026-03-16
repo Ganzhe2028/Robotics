@@ -83,6 +83,18 @@
   * 确认当前目标站点
   * 启动小车运行
 
+### 3.1.1 316 单按钮实现变体
+
+当前 `316/316.ino` 采用单按钮实现，保留同一套站点算法：
+
+* `START = D6`
+* 按钮事件仍基于 `INPUT_PULLUP`
+* **短按释放**：按 `1 -> 2 -> 3 -> 1` 循环选择目标站点
+* 若两次短按间隔超过 `1500ms`，下次短按会从 `1` 重新开始计数
+* **长按约 `700ms`**：只有当前传感器位于 `0110` 主线上时才允许启动
+
+> 也就是说，`316` 没有额外的确认按钮，只是把“选站”和“启动”合并到了同一个 `START` 按钮上。
+
 ### 3.2 初始摆放约束
 
 启动前，人工将机器人摆放在正常主线上。
@@ -96,6 +108,17 @@
 * `READY` 用于显示启动前目标站和当前 4 路传感器值
 * `RUN / GAP / ST / TURN / DROP / END` 用于显示关键运行事件
 * 详细按钮诊断日志放在 `3.11`，不在 `3.9` 中持续输出
+
+当前 `316` 版本额外强调以下可读事件文案，方便在 Serial Monitor 里直接确认是否识别成功：
+
+* `station detected`
+* `station pass`
+* `station match -> drop`
+* `gap add / gap sub`
+* `end candidate / end confirmed`
+* `turnaround`
+
+同时，`316` 会比 `3.9` 更高频地输出运行状态，当前限频常量是 `STATUS_PRINT_MS = 250`，用于更密集地观察现场传感器模式变化。
 
 ---
 
@@ -136,6 +159,24 @@
 * `lastButtonTime` / `lastSensorEventTime`
 
   * 用于按钮或事件防抖
+
+### 4.3 316 的运动调参常量
+
+`316/316.ino` 将连续旋转舵机的动作角度拆成顶部常量，现场调参优先改这些值，而不是改判断逻辑：
+
+* `LEFT_STOP_ANGLE` / `RIGHT_STOP_ANGLE`
+* `LEFT_FORWARD_ANGLE` / `RIGHT_FORWARD_ANGLE`
+* `LEFT_SOFT_LEFT_ANGLE` / `RIGHT_SOFT_LEFT_ANGLE`
+* `LEFT_SOFT_RIGHT_ANGLE` / `RIGHT_SOFT_RIGHT_ANGLE`
+* `LEFT_HARD_LEFT_ANGLE` / `RIGHT_HARD_LEFT_ANGLE`
+* `LEFT_HARD_RIGHT_ANGLE` / `RIGHT_HARD_RIGHT_ANGLE`
+
+另外，`316` 还增加了两组与现场稳定性相关的时间常量：
+
+* `TURN_SIGNAL_CONFIRM_MS`
+  直角转弯信号先延迟确认，默认 `50ms`，用于避免 `0111/1110 -> 1111` 的站点前沿被误判成转弯
+* `STATION_EVENT_COOLDOWN_MS` / `GAP_EVENT_COOLDOWN_MS`
+  用于抑制同一条横线或同一段缺口被重复累计
 
 ---
 
